@@ -1,0 +1,125 @@
+:param pipelinename => "mypipe";
+:param graphname => "mygraph";
+:param modelname => "mymodel";
+
+CALL gds.beta.pipeline.drop($pipelinename, false)
+YIELD pipelineName, pipelineType;
+
+CALL gds.graph.drop($graphname, false) YIELD graphName;
+
+CALL gds.beta.model.drop($modelname, false)
+YIELD modelInfo, loaded, shared, stored
+RETURN modelInfo.modelName AS modelName, loaded, shared, stored;
+
+//Create Link Pipeline
+CALL gds.beta.pipeline.linkPrediction.create($pipelinename);
+
+//Add Node Property (Embedding)
+//CALL gds.beta.pipeline.linkPrediction.addNodeProperty($pipelinename, 'fastRP', {
+//  mutateProperty: 'embedding',
+//  embeddingDimension: 256,
+//  randomSeed: 42,
+//  contextNodeLabels: ['Patient','Diag','Drug','Weight','IHD'],
+//  contextRelationshipTypes: ['IHD_RISK','DIAGNOSED_WITH', 'PRESCRIBED']
+//});
+
+//Add Node Property (Embedding)
+//CALL gds.beta.pipeline.linkPrediction.addNodeProperty($pipelinename, 'degree', {
+//  mutateProperty: 'embedding'
+//});
+
+
+CALL gds.beta.pipeline.linkPrediction.addNodeProperty($pipelinename, 'fastRP', {
+  mutateProperty: 'embedding',
+  embeddingDimension: 256,
+  randomSeed: 42,
+  iterationWeights: [1.0]
+});
+
+//Add Feature
+CALL gds.beta.pipeline.linkPrediction.addFeature($pipelinename, 'COSINE', {
+  nodeProperties: ['embedding']
+}) YIELD featureSteps;
+
+//Data Split
+CALL gds.beta.pipeline.linkPrediction.configureSplit($pipelinename, {
+  testFraction: 0.2,
+  trainFraction: 0.2,
+  validationFolds: 3
+});
+
+//Add Model Candidates
+CALL gds.beta.pipeline.linkPrediction.addLogisticRegression($pipelinename)
+YIELD parameterSpace;
+
+CALL gds.alpha.pipeline.linkPrediction.addMLP($pipelinename,
+{hiddenLayerSizes: [4, 2], penalty: 1, patience: 2})
+YIELD parameterSpace;
+
+//CALL gds.alpha.pipeline.linkPrediction.addRandomForest($pipelinename, {numberOfDecisionTrees: 10})
+//YIELD parameterSpace
+//RETURN parameterSpace.RandomForest AS randomForestSpace, parameterSpace.LogisticRegression AS logisticRegressionSpace, parameterSpace.MultilayerPerceptron AS MultilayerPerceptronSpace;
+
+//Create context graph
+//CALL gds.graph.project(
+//  $graphname,
+//  {
+//    Patient: {
+//      properties: {Age: {defaultValue: 1}}
+//    },
+//    Weight: {
+//      properties: {Value: {defaultValue: 50}}
+//    },
+//    Diag: {},
+//    Drug: {},
+//    IHD: {}
+//  },
+//  {
+//    IHD_RISK: {
+//      orientation: 'UNDIRECTED'
+//    },
+//    DIAGNOSED_WITH: {},
+//   MEASURES: {},
+//    PRESCRIBED: {}
+//  }
+//);
+
+//Create context graph
+CALL gds.graph.project(
+  $graphname,
+  ['Patient','Diag','Drug','IHD'],
+  {
+    IHD_RISK: {
+      orientation: 'UNDIRECTED'
+    },
+    DIAGNOSED_WITH: {},
+    PRESCRIBED: {}
+  }
+);
+
+//Train Model
+CALL gds.beta.pipeline.linkPrediction.train($graphname, {
+  pipeline: $pipelinename,
+  modelName: $modelname,
+  metrics: ['AUCPR', 'OUT_OF_BAG_ERROR'],
+  sourceNodeLabel: 'Patient',
+  targetNodeLabel: 'IHD',
+  targetRelationshipType: 'IHD_RISK',
+  randomSeed: 12
+}) YIELD modelInfo, modelSelectionStats
+RETURN
+  modelInfo.bestParameters AS winningModel,
+  modelInfo.metrics.AUCPR.train.avg AS avgTrainScore,
+  modelInfo.metrics.AUCPR.outerTrain AS outerTrainScore,
+  modelInfo.metrics.AUCPR.test AS testScore,
+  [cand IN modelSelectionStats.modelCandidates | cand.metrics.AUCPR.validation.avg] AS validationScores;
+
+//Make Predictions
+CALL gds.beta.pipeline.linkPrediction.predict.stream($graphname, {
+  modelName: $modelname,
+  topN: 20,
+  threshold: 0.1
+})
+ YIELD node1, node2, probability
+RETURN COALESCE(gds.util.asNode(node1).PatientID,gds.util.asNode(node1).type) AS Node_1, COALESCE(gds.util.asNode(node2).Name, gds.util.asNode(node2).type) AS Node_2, probability
+ ORDER BY probability DESC;

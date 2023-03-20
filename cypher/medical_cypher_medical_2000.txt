@@ -1,0 +1,29 @@
+MATCH (n) DETACH DELETE n;
+
+CREATE CONSTRAINT PatientConstraint IF NOT EXISTS FOR (p:Patient) REQUIRE p.PatientID IS UNIQUE;
+CREATE CONSTRAINT DrugConstraint IF NOT EXISTS FOR (d:Drug) REQUIRE d.ID IS UNIQUE;
+CREATE CONSTRAINT DiagConstraint IF NOT EXISTS FOR (d:Diag) REQUIRE d.ID IS UNIQUE;
+CREATE CONSTRAINT WeightConstraint IF NOT EXISTS FOR (w:Weight) REQUIRE w.Value IS UNIQUE;
+CREATE CONSTRAINT IHDConstraint IF NOT EXISTS FOR (i:IHD) REQUIRE i.Name IS UNIQUE;
+
+LOAD CSV WITH HEADERS FROM 'file:///medical_2000/patients.csv' AS line
+MERGE (p:Patient {PatientID: line.PatientID})
+SET p.Age = toInteger(line.Age)
+MERGE (w:Weight {Value: toInteger(line.Weight)})
+MERGE (p)-[:MEASURES]->(w);
+
+LOAD CSV WITH HEADERS FROM 'file:///medical_2000/ihds.csv' AS line
+MERGE (p:Patient {PatientID: line.PatientID})
+MERGE (i:IHD {Name:line.IHD})
+MERGE (p)-[:IHD_RISK]->(i);
+
+LOAD CSV WITH HEADERS FROM 'file:///medical_2000/drugs.csv' AS line
+MERGE (p:Patient {PatientID: line.PatientID})
+MERGE (d:Drug {ID: line.Drug})
+MERGE (p)-[:PRESCRIBED]->(d);
+
+LOAD CSV WITH HEADERS FROM 'file:///medical_2000/diags.csv' AS line
+MERGE (p:Patient {PatientID: line.PatientID})
+MERGE (d:Diag {ID: line.Diag})
+MERGE (p)-[:DIAGNOSED_WITH]->(d);
+

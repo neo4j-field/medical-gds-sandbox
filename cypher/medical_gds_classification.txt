@@ -1,0 +1,151 @@
+:param pipelinename => "mypipe";
+:param graphname => "mygraph";
+:param graphname2 => "mygraph2";
+:param graphtrain => "graph-train";
+:param graphtest => "graph-test";
+:param modelname => "ihd";
+
+match (n) set n.targetProperty = null, n.fastRP__Embed=null, n.targetProperty = 0;
+
+////////////////////
+// Replace relatiohsip to IHD by a property
+match (n:Patient)-[:IHD_RISK]->(i:IHD) set n.targetProperty = 1;
+
+////////////////////
+// Transform Rels into Props
+
+MATCH (d:Patient)
+SET d.Drug_Diab=0, d.Drug_Dyslipidaemia=0, d.Drug_Osteo=0, d.Drug_Hypertension=0, d.Diag_Renal=0, d.Diag_Hypertension=0, d.Diag_Diabetes=0;
+
+MATCH (d:Drug) WITH  collect(d.ID) AS Drugs
+UNWIND Drugs AS drug
+MATCH (p:Patient)-[:PRESCRIBED]->(d:Drug {ID:drug})
+WITH p, drug
+CALL apoc.create.setProperty(p, "Drug_"+drug, 1)
+YIELD node
+RETURN node;
+
+MATCH (d:Diag) WITH  collect(d.ID) AS Diags
+UNWIND Diags AS diag
+MATCH (p:Patient)-[:DIAGNOSED_WITH]->(d:Diag {ID:diag})
+WITH p, diag
+CALL apoc.create.setProperty(p, "Diag_"+diag, 1)
+YIELD node
+RETURN node;
+
+////////////////////
+// Delete previous run
+CALL gds.graph.drop($graphname, false) YIELD graphName;
+
+////////////////////
+//Create context graph
+CALL gds.graph.project(
+  $graphname,
+  ['Patient','Diag','Drug'],
+  ['DIAGNOSED_WITH','PRESCRIBED'],
+  { nodeProperties: ['Drug_Diab','Drug_Dyslipidaemia','Drug_Osteo','Drug_Hypertension','Diag_Renal','Diag_Hypertension','Diag_Diabetes'] }
+)                      
+YIELD graphName, nodeProjection, nodeCount AS nodes, relationshipCount AS rels
+RETURN graphName, nodeProjection AS patientProjection, nodes, rels;
+
+////////////////////
+// Fast RP the graph STREAM
+CALL gds.fastRP.stream($graphname,{
+    embeddingDimension: 1024,
+    nodeLabels: ['Patient'],
+    randomSeed: 65000,
+	propertyRatio: 1.0,
+    nodeSelfInfluence: 1.0,
+    featureProperties: ['Drug_Diab','Drug_Dyslipidaemia','Drug_Osteo','Drug_Hypertension','Diag_Renal','Diag_Hypertension','Diag_Diabetes']
+});
+
+////////////////////
+// Fast RP the graph WRITE
+CALL gds.fastRP.write($graphname,{
+    embeddingDimension: 1024,
+    nodeLabels: ['Patient'],
+    randomSeed: 65000,
+	propertyRatio: 1.0,
+    nodeSelfInfluence: 1.0,
+	featureProperties: ['Drug_Diab','Drug_Dyslipidaemia','Drug_Osteo','Drug_Hypertension','Diag_Renal','Diag_Hypertension','Diag_Diabetes'],
+    writeProperty: 'fastRP__Embed'
+});
+
+////////////////////
+// Delete previous run
+CALL gds.graph.drop($graphname2, false) YIELD graphName;
+
+///////////////////
+// project graph for node classification
+WITH {
+  Patient: { properties: ['targetProperty', 'fastRP__Embed'] }, 
+  Drug: { properties: { targetProperty: {} }},
+  Diag: { properties: { targetProperty: {} }} 
+} AS inputs
+CALL gds.graph.project(
+  $graphname2,
+  inputs,
+  ['PRESCRIBED','DIAGNOSED_WITH']
+)   
+YIELD graphName, nodeProjection, nodeCount AS nodes, relationshipCount AS rels
+RETURN graphName, nodeProjection AS patientProjection, nodes, rels;
+
+////////////////////
+// Delete previous pipeline
+CALL gds.beta.pipeline.drop($pipelinename, false)
+YIELD pipelineName, pipelineType;
+
+////////////////////
+// Create new pipeline
+CALL gds.beta.pipeline.nodeClassification.create($pipelinename);
+
+CALL gds.beta.pipeline.nodeClassification.selectFeatures($pipelinename, ['fastRP__Embed'])
+YIELD name, featureProperties;
+
+CALL gds.beta.pipeline.nodeClassification.configureSplit($pipelinename, {})
+YIELD splitConfig;
+
+CALL gds.beta.pipeline.nodeClassification.addLogisticRegression($pipelinename, {})
+YIELD parameterSpace;
+
+CALL gds.alpha.pipeline.nodeClassification.addRandomForest($pipelinename, {})
+YIELD parameterSpace;
+
+CALL gds.alpha.pipeline.nodeClassification.addMLP($pipelinename, {})
+YIELD parameterSpace;
+
+////////////////////
+// Delete previous run
+CALL gds.beta.model.drop($modelname, false)
+YIELD modelInfo, loaded, shared, stored
+RETURN modelInfo.modelName AS modelName, loaded, shared, stored;
+
+// train model
+CALL gds.beta.pipeline.nodeClassification.train($graphname2, {
+  pipeline: $pipelinename,
+  targetNodeLabels: ['Patient'],
+  modelName: $modelname,
+  targetProperty: 'targetProperty',
+  randomSeed: 65000,
+  metrics: ['F1_WEIGHTED','ACCURACY']
+}) ;
+
+////////////////////
+// Delete previous run
+CALL gds.graph.drop($graphtest, false) YIELD graphName;
+
+////////////////////
+// Test graph
+CALL gds.beta.graph.project.subgraph($graphtest, $graphname2, 'n:Patient AND n.targetProperty = 0', '*')
+    YIELD graphName, fromGraphName, nodeCount, relationshipCount;
+
+////////////////////
+// now predict
+CALL gds.beta.pipeline.nodeClassification.predict.stream($graphtest, {
+  modelName: $modelname,
+  includePredictedProbabilities: true,
+  targetNodeLabels: ['Patient']
+})
+YIELD nodeId, predictedClass, predictedProbabilities
+WITH gds.util.asNode(nodeId).PatientID AS PatientID, predictedClass, predictedProbabilities
+RETURN PatientID, predictedClass, predictedProbabilities;
